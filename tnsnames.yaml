@@ -1,0 +1,92 @@
+# Example Usage: ansible-playbook -i inventory tnsnames.yaml -e kenan_environment=K35 
+# This playbook creates the tnsnames.ora file required for oracle client connections on KenanFX4 machines based on kenan properties stored in GIT
+# Author: Mark Scrymgeour 
+
+---
+- name: tnsnames.ora deployment
+  hosts: local 
+  connection: local
+  vars:
+    - properties_array: ["kenan.db.type","kenan.db.admin.tns","kenan.db.customer.tns"]
+    - property_value: []
+    - tns_custdb_string_array: []
+    - full_tns_string: ""
+
+  tasks:
+    - name: git clone repository
+      when: inventory_hostname in groups['local']
+      git:
+        repo: 'git@lws-git.bskyb.com:devops/kfx4-deploy.git'
+        dest: /home/kfx4-deploy/
+        force: yes
+        update: yes
+
+    - name: kfx4_get_props result hash
+      when: inventory_hostname in groups['local']
+      command: /home/kfx4-deploy/scripts/kfx4_get_props.pl -e {{ kenan_environment }} -p {{ item }} 
+      with_items: "{{ properties_array }}"
+      register: properties_values
+
+    - name: set values array 
+      set_fact:
+        property_value: "{{ property_value }} + [ '{{ item.stdout  }}' ]"
+      with_items: "{{ properties_values.results }}"
+
+    - name: set tns facts from properties
+      set_fact:
+        tns_type:          "{{ property_value[0] }}"
+        tns_adm_cat:       "{{ property_value[1] }}"
+        tns_customer_sid:  "{{ property_value[2] }}"
+
+    - name: set custom facts
+      set_fact:
+        tns_adm_cat_host: "{{ tns_adm_cat.split(':')[0] }}"
+        tns_adm_cat_sid:  "{{ tns_adm_cat.split(':')[1] }}"
+        tns_customer_array: "{{ tns_customer_sid.split(',') }}"
+
+    - name: create adm_cat entry 
+      set_fact:
+        tns_adm_cat_sid_array: "{{ tns_adm_cat_sid }}=(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST={{ tns_adm_cat_host }})(PORT=1525))(CONNECT_DATA=(SID={{ tns_adm_cat_sid }})))"
+        tns_file: "/var/opt/oracle/tnsnames.ora"
+
+    - name: create mse2 / mse6 tns array entry
+      when: tns_type == "mse2" or tns_type == "mse6" 
+      set_fact:
+        tns_custdb_string_array: "{{ tns_custdb_string_array }} + [ '{{ item.split(':')[1] }}=(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST={{ item.split(':')[0] }})(PORT=1525))(CONNECT_DATA=(SID={{ item.split(':')[1] }})))' ]"
+      with_items:  "{{ tns_customer_array }}"
+
+    - name: set output for sse
+      when: tns_type == "sse"
+      set_fact:
+        full_tns_array: "['{{ tns_adm_cat_sid_array }}']"
+
+    - name: set output for mse / mse6 tns
+      when: tns_type == "mse2" or tns_type == "mse6"
+      set_fact:
+        full_tns_array: "['{{ tns_adm_cat_sid_array }}'] + {{ tns_custdb_string_array }}"
+
+    - name: set tns string
+      set_fact:
+        full_tns_string: "{{ full_tns_string }}{{ item }}\n"
+      with_items: "{{ full_tns_array }}"
+
+  ## 
+  ## REMOTE TNS CREATION
+  ## 
+
+- name: remote tnsdeploy
+  hosts: remote
+  gather_facts: False
+  vars:
+    - tns_file_remote: "{{ hostvars['localhost']['tns_file'] }}"
+    - full_tns_string: "{{ hostvars['localhost']['full_tns_string'] }}"
+ 
+  tasks:
+    - name: ensure file exists
+      copy:
+        content: "{{ full_tns_string }}"
+        dest: "{{ tns_file_remote }}"
+        force: yes
+        group: dba
+        owner: oracle
+        mode: 0755
